@@ -37,6 +37,8 @@ Library usage:
     )
 """
 
+from __future__ import annotations
+
 import json
 import os
 import random
@@ -98,6 +100,9 @@ XHS_CONTENT_DATA_URL = "https://creator.xiaohongshu.com/statistics/data-analysis
 XHS_CONTENT_DATA_API_PATH = "/api/galaxy/creator/datacenter/note/analyze/list"
 XHS_NOTIFICATION_MENTIONS_API_PATH = "/api/sns/web/v1/you/mentions"
 XHS_SEARCH_RECOMMEND_API_PATH = "/api/sns/web/v1/search/recommend"
+XHS_EXPLORE_URL = "https://www.xiaohongshu.com/explore"
+XHS_FOLLOWING_FEED_URL = "https://www.xiaohongshu.com/explore?channel_id=homefeed.following_v3"
+XHS_USER_PROFILE_URL_TEMPLATE = "https://www.xiaohongshu.com/user/profile/{user_id}"
 XHS_FEED_INACCESSIBLE_KEYWORDS = (
     "当前笔记暂时无法浏览",
     "该内容因违规已被删除",
@@ -415,7 +420,7 @@ class XiaohongshuPublisher:
         url = f"http://{self.host}:{self.port}/json"
         for attempt in range(2):
             try:
-                resp = requests.get(url, timeout=5)
+                resp = requests.get(url, timeout=5, proxies={"http": None, "https": None})
                 resp.raise_for_status()
                 return resp.json()
             except Exception as e:
@@ -468,6 +473,7 @@ class XiaohongshuPublisher:
         resp = requests.put(
             f"http://{self.host}:{self.port}/json/new?{XHS_CREATOR_URL}",
             timeout=5,
+            proxies={"http": None, "https": None},
         )
         if resp.ok:
             ws_url = resp.json().get("webSocketDebuggerUrl", "")
@@ -490,7 +496,17 @@ class XiaohongshuPublisher:
             raise CDPError("Could not obtain WebSocket URL for any tab.")
 
         print(f"[cdp_publish] Connecting to {ws_url}")
-        self.ws = ws_client.connect(ws_url)
+        # Temporarily disable proxy for local WebSocket connections
+        # (websockets lib honors HTTP_PROXY and routes local CDP through proxy)
+        saved_proxies = {}
+        if _is_local_host(self.host):
+            for key in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy"):
+                if key in os.environ:
+                    saved_proxies[key] = os.environ.pop(key)
+        try:
+            self.ws = ws_client.connect(ws_url)
+        finally:
+            os.environ.update(saved_proxies)
         print("[cdp_publish] Connected to Chrome tab.")
 
     def disconnect(self):
@@ -2098,6 +2114,1244 @@ class XiaohongshuPublisher:
             })
             time.sleep(0.05)
 
+    # ------------------------------------------------------------------
+    # Screenshot and scroll infrastructure
+    # ------------------------------------------------------------------
+
+    def capture_screenshot(
+        self, output_path: str | None = None, quality: int = 80
+    ) -> dict[str, Any]:
+        """Capture a screenshot of the current page via CDP.
+
+        Args:
+            output_path: Optional file path to save the screenshot.
+                         If None, saves to tmp/screenshots/ with timestamp.
+            quality: JPEG quality 1-100 (default: 80).
+
+        Returns:
+            {"success": True, "path": "/abs/path/screenshot.jpg", "base64_length": N}
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        result = self._send("Page.captureScreenshot", {
+            "format": "jpeg",
+            "quality": quality,
+            "fromSurface": True,
+        })
+        image_data = result.get("data", "")
+        if not image_data:
+            return {"success": False, "error": "Empty screenshot data"}
+
+        if output_path:
+            abs_path = os.path.abspath(output_path)
+        else:
+            screenshot_dir = os.path.abspath(
+                os.path.join(SCRIPT_DIR, "..", "tmp", "screenshots")
+            )
+            os.makedirs(screenshot_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            abs_path = os.path.join(screenshot_dir, f"screenshot_{timestamp}.jpg")
+
+        with open(abs_path, "wb") as f:
+            f.write(base64.b64decode(image_data))
+
+        print(f"[cdp_publish] Screenshot saved to {abs_path}")
+        return {
+            "success": True,
+            "path": abs_path,
+            "base64_length": len(image_data),
+        }
+
+    def _scroll_page(
+        self, direction: str = "down", distance: int = 600
+    ) -> dict[str, Any]:
+        """Scroll the current page with human-like behavior.
+
+        Args:
+            direction: "down" or "up".
+            distance: Total pixels to scroll.
+
+        Returns:
+            {"scrollY_before": N, "scrollY_after": M, "scrollHeight": H,
+             "clientHeight": C, "at_bottom": bool}
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        sign = 1 if direction == "down" else -1
+        # Split into 2-3 smaller scrolls for human-like behavior
+        steps = random.randint(2, 3)
+        step_distance = distance // steps
+
+        before_info = self._evaluate("""
+            (function() {
+                return {
+                    scrollY: window.scrollY,
+                    scrollHeight: document.documentElement.scrollHeight,
+                    clientHeight: document.documentElement.clientHeight
+                };
+            })();
+        """)
+
+        for i in range(steps):
+            d = step_distance * sign
+            if i == steps - 1:
+                # Last step takes the remainder
+                d = (distance - step_distance * (steps - 1)) * sign
+            self._evaluate(f"window.scrollBy({{top: {d}, behavior: 'smooth'}});")
+            self._sleep(0.3, minimum_seconds=0.15)
+
+        # Wait for lazy-loaded content to render
+        self._sleep(1.5, minimum_seconds=0.8)
+
+        after_info = self._evaluate("""
+            (function() {
+                return {
+                    scrollY: window.scrollY,
+                    scrollHeight: document.documentElement.scrollHeight,
+                    clientHeight: document.documentElement.clientHeight
+                };
+            })();
+        """)
+
+        at_bottom = (
+            after_info["scrollY"] + after_info["clientHeight"]
+            >= after_info["scrollHeight"] - 5
+        )
+
+        return {
+            "scrollY_before": before_info.get("scrollY", 0),
+            "scrollY_after": after_info.get("scrollY", 0),
+            "scrollHeight": after_info.get("scrollHeight", 0),
+            "clientHeight": after_info.get("clientHeight", 0),
+            "at_bottom": at_bottom,
+        }
+
+    # ------------------------------------------------------------------
+    # Browsing: home feed, following feed, user profile, note detail
+    # ------------------------------------------------------------------
+
+    def _extract_feeds_from_page(self) -> list[dict[str, Any]]:
+        """Extract feed items from the current page via __INITIAL_STATE__ or DOM."""
+        # Strategy 1: __INITIAL_STATE__
+        feeds_json = self._evaluate("""
+            (function() {
+                var state = window.__INITIAL_STATE__;
+                if (!state) return '[]';
+                var candidates = [
+                    state.home && state.home.feeds,
+                    state.homeFeed && state.homeFeed.feeds,
+                    state.explore && state.explore.feeds,
+                    state.feed && state.feed.feeds,
+                ];
+                for (var i = 0; i < candidates.length; i++) {
+                    var f = candidates[i];
+                    if (!f) continue;
+                    var arr = f.value || f._value || f;
+                    if (Array.isArray(arr) && arr.length > 0) {
+                        return JSON.stringify(arr.map(function(item) {
+                            var note = item.noteCard || item.note_card || item;
+                            var user = note.user || item.user || {};
+                            return {
+                                note_id: item.id || note.noteId || note.note_id || '',
+                                xsec_token: item.xsec_token || item.xsecToken || '',
+                                title: note.displayTitle || note.display_title || note.title || '',
+                                author: user.nickName || user.nickname || user.nick_name || '',
+                                author_id: user.userId || user.user_id || '',
+                                cover_url: (note.cover && (note.cover.urlDefault || note.cover.url)) || '',
+                                like_count: (note.interactInfo && note.interactInfo.likedCount) || '',
+                                type: note.type || ''
+                            };
+                        }));
+                    }
+                }
+                return '[]';
+            })();
+        """)
+
+        feeds = []
+        if feeds_json and feeds_json != "[]":
+            try:
+                feeds = json.loads(feeds_json)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        if feeds:
+            return feeds
+
+        # Strategy 2: DOM fallback
+        dom_json = self._evaluate("""
+            (function() {
+                var cards = document.querySelectorAll(
+                    'section.note-item, [class*="note-item"], a[href*="/explore/"]'
+                );
+                var results = [];
+                var seen = {};
+                for (var i = 0; i < cards.length; i++) {
+                    var card = cards[i];
+                    var link = card.tagName === 'A' ? card :
+                        (card.querySelector('a[href*="/explore/"]') ||
+                         card.closest('a[href*="/explore/"]'));
+                    if (!link) continue;
+                    var href = link.getAttribute('href') || '';
+                    var match = href.match(/explore\\/([a-f0-9]+)/);
+                    var noteId = match ? match[1] : '';
+                    if (!noteId || seen[noteId]) continue;
+                    seen[noteId] = true;
+                    var search = '';
+                    try { search = new URL(link.href, location.origin).search; } catch(e) {}
+                    var params = new URLSearchParams(search);
+                    var titleEl = card.querySelector('[class*="title"], .title, span.title');
+                    var authorEl = card.querySelector('[class*="author"], .author-wrapper .name, .nickname');
+                    var likeEl = card.querySelector('[class*="like-count"], .count, [class*="like"] .count');
+                    var coverEl = card.querySelector('img');
+                    results.push({
+                        note_id: noteId,
+                        xsec_token: params.get('xsec_token') || '',
+                        title: (titleEl && titleEl.textContent || '').trim(),
+                        author: (authorEl && authorEl.textContent || '').trim(),
+                        author_id: '',
+                        cover_url: (coverEl && coverEl.src) || '',
+                        like_count: (likeEl && likeEl.textContent || '').trim(),
+                        type: ''
+                    });
+                }
+                return JSON.stringify(results);
+            })();
+        """)
+
+        if dom_json:
+            try:
+                feeds = json.loads(dom_json)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        return feeds
+
+    def browse_home_feed(
+        self,
+        max_items: int = 20,
+        scroll_count: int = 3,
+        take_screenshot: bool = False,
+    ) -> dict[str, Any]:
+        """Browse the Xiaohongshu explore/home feed.
+
+        Args:
+            max_items: Maximum feed items to extract.
+            scroll_count: Number of scroll iterations for more content.
+            take_screenshot: Capture screenshot after loading.
+
+        Returns:
+            {"url": "...", "feed_count": N, "feeds": [...], "screenshot_path": ...}
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        print("[cdp_publish] Browsing home feed...")
+        self._navigate(XHS_EXPLORE_URL)
+        self._sleep(PAGE_LOAD_WAIT, minimum_seconds=1.5)
+
+        all_feeds: dict[str, dict] = {}
+
+        # Initial extraction
+        for item in self._extract_feeds_from_page():
+            nid = item.get("note_id")
+            if nid and nid not in all_feeds:
+                all_feeds[nid] = item
+
+        # Scroll for more content
+        for i in range(scroll_count):
+            if len(all_feeds) >= max_items:
+                break
+            print(f"[cdp_publish] Scrolling ({i + 1}/{scroll_count})...")
+            scroll_result = self._scroll_page(direction="down", distance=800)
+            for item in self._extract_feeds_from_page():
+                nid = item.get("note_id")
+                if nid and nid not in all_feeds:
+                    all_feeds[nid] = item
+            if scroll_result.get("at_bottom"):
+                print("[cdp_publish] Reached bottom of page.")
+                break
+
+        feeds_list = list(all_feeds.values())[:max_items]
+        screenshot_path = None
+        if take_screenshot:
+            ss = self.capture_screenshot()
+            screenshot_path = ss.get("path")
+
+        print(f"[cdp_publish] Found {len(feeds_list)} feed items.")
+        return {
+            "url": XHS_EXPLORE_URL,
+            "feed_count": len(feeds_list),
+            "feeds": feeds_list,
+            "screenshot_path": screenshot_path,
+        }
+
+    def browse_following_feed(
+        self,
+        max_items: int = 20,
+        scroll_count: int = 3,
+        take_screenshot: bool = False,
+    ) -> dict[str, Any]:
+        """Browse the following feed (content from followed users).
+
+        Args:
+            max_items: Maximum feed items to extract.
+            scroll_count: Number of scroll iterations.
+            take_screenshot: Capture screenshot after loading.
+
+        Returns:
+            {"url": "...", "feed_count": N, "feeds": [...], "screenshot_path": ...}
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        print("[cdp_publish] Browsing following feed...")
+        self._navigate(XHS_FOLLOWING_FEED_URL)
+        self._sleep(PAGE_LOAD_WAIT, minimum_seconds=1.5)
+
+        # Try clicking the "关注" tab as a fallback if URL param doesn't work
+        self._evaluate("""
+            (function() {
+                var tabs = document.querySelectorAll(
+                    '[class*="channel"] [class*="tab"], [class*="tab-item"], [class*="channel-item"]'
+                );
+                for (var i = 0; i < tabs.length; i++) {
+                    var text = (tabs[i].textContent || '').trim();
+                    if (text === '关注' || text === 'Following') {
+                        tabs[i].click();
+                        return true;
+                    }
+                }
+                return false;
+            })();
+        """)
+        self._sleep(2, minimum_seconds=1.0)
+
+        all_feeds: dict[str, dict] = {}
+
+        for item in self._extract_feeds_from_page():
+            nid = item.get("note_id")
+            if nid and nid not in all_feeds:
+                all_feeds[nid] = item
+
+        for i in range(scroll_count):
+            if len(all_feeds) >= max_items:
+                break
+            print(f"[cdp_publish] Scrolling ({i + 1}/{scroll_count})...")
+            scroll_result = self._scroll_page(direction="down", distance=800)
+            for item in self._extract_feeds_from_page():
+                nid = item.get("note_id")
+                if nid and nid not in all_feeds:
+                    all_feeds[nid] = item
+            if scroll_result.get("at_bottom"):
+                print("[cdp_publish] Reached bottom of page.")
+                break
+
+        feeds_list = list(all_feeds.values())[:max_items]
+        screenshot_path = None
+        if take_screenshot:
+            ss = self.capture_screenshot()
+            screenshot_path = ss.get("path")
+
+        print(f"[cdp_publish] Found {len(feeds_list)} following feed items.")
+        return {
+            "url": XHS_FOLLOWING_FEED_URL,
+            "feed_count": len(feeds_list),
+            "feeds": feeds_list,
+            "screenshot_path": screenshot_path,
+        }
+
+    def view_user_profile(
+        self,
+        user_id: str,
+        max_notes: int = 20,
+        scroll_count: int = 2,
+        take_screenshot: bool = False,
+    ) -> dict[str, Any]:
+        """View a user's profile and their notes list.
+
+        Args:
+            user_id: Xiaohongshu user ID.
+            max_notes: Maximum notes to extract.
+            scroll_count: Number of scroll iterations.
+            take_screenshot: Capture screenshot.
+
+        Returns:
+            {"user_id": "...", "user_info": {...}, "notes_count": N,
+             "notes": [...], "screenshot_path": ...}
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        url = XHS_USER_PROFILE_URL_TEMPLATE.format(user_id=user_id.strip())
+        print(f"[cdp_publish] Viewing user profile: {url}")
+        self._navigate(url)
+        self._sleep(PAGE_LOAD_WAIT, minimum_seconds=2.0)
+
+        # Extract user info from __INITIAL_STATE__
+        user_json = self._evaluate("""
+            (function() {
+                var state = window.__INITIAL_STATE__;
+                if (!state || !state.user) return '{}';
+                var u = state.user.userPageData || state.user;
+                if (!u) return '{}';
+                var basicInfo = u.basicInfo || u;
+                var interactions = u.interactions || [];
+                var interMap = {};
+                if (Array.isArray(interactions)) {
+                    for (var i = 0; i < interactions.length; i++) {
+                        var item = interactions[i];
+                        interMap[item.type || item.name || ''] = item.count || 0;
+                    }
+                }
+                return JSON.stringify({
+                    nickname: basicInfo.nickname || basicInfo.nickName || '',
+                    avatar: basicInfo.imageb || basicInfo.image || basicInfo.avatar || '',
+                    red_id: basicInfo.redId || basicInfo.red_id || '',
+                    description: basicInfo.desc || basicInfo.description || '',
+                    ip_location: basicInfo.ipLocation || '',
+                    gender: basicInfo.gender || '',
+                    follows: interMap.follows || u.follows || 0,
+                    fans: interMap.fans || u.fans || 0,
+                    interaction: interMap.interaction || u.interaction || 0,
+                });
+            })();
+        """)
+
+        user_info = {}
+        if user_json:
+            try:
+                user_info = json.loads(user_json)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Extract notes
+        notes_json = self._evaluate("""
+            (function() {
+                var state = window.__INITIAL_STATE__;
+                if (!state || !state.user) return '[]';
+                var notes = state.user.notes;
+                if (!notes) return '[]';
+                var arr = notes.value || notes._value || notes;
+                if (!Array.isArray(arr)) {
+                    // Try flat array structure
+                    arr = state.user.noteList || state.user.note_list || [];
+                }
+                if (!Array.isArray(arr)) return '[]';
+                return JSON.stringify(arr.slice(0, 50).map(function(item) {
+                    var note = item.noteCard || item.note_card || item;
+                    return {
+                        note_id: item.id || item.noteId || note.noteId || '',
+                        xsec_token: item.xsec_token || item.xsecToken || '',
+                        title: note.displayTitle || note.display_title || note.title || '',
+                        cover_url: (note.cover && (note.cover.urlDefault || note.cover.url)) || '',
+                        like_count: (note.interactInfo && note.interactInfo.likedCount) || '',
+                        type: note.type || ''
+                    };
+                }));
+            })();
+        """)
+
+        notes = []
+        if notes_json:
+            try:
+                notes = json.loads(notes_json)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # Scroll for more notes
+        all_note_ids = {n["note_id"] for n in notes if n.get("note_id")}
+        for i in range(scroll_count):
+            if len(notes) >= max_notes:
+                break
+            print(f"[cdp_publish] Scrolling for more notes ({i + 1}/{scroll_count})...")
+            scroll_result = self._scroll_page(direction="down", distance=600)
+            # Re-extract after scroll (DOM-based)
+            more_json = self._evaluate("""
+                (function() {
+                    var cards = document.querySelectorAll(
+                        'section.note-item, [class*="note-item"], a[href*="/explore/"]'
+                    );
+                    var results = [];
+                    for (var i = 0; i < cards.length; i++) {
+                        var card = cards[i];
+                        var link = card.tagName === 'A' ? card :
+                            (card.querySelector('a[href*="/explore/"]') ||
+                             card.closest('a[href*="/explore/"]'));
+                        if (!link) continue;
+                        var href = link.getAttribute('href') || '';
+                        var match = href.match(/explore\\/([a-f0-9]+)/);
+                        var noteId = match ? match[1] : '';
+                        if (!noteId) continue;
+                        var search = '';
+                        try { search = new URL(link.href, location.origin).search; } catch(e) {}
+                        var params = new URLSearchParams(search);
+                        var titleEl = card.querySelector('[class*="title"], .title');
+                        var coverEl = card.querySelector('img');
+                        var likeEl = card.querySelector('[class*="like-count"], [class*="like"] .count');
+                        results.push({
+                            note_id: noteId,
+                            xsec_token: params.get('xsec_token') || '',
+                            title: (titleEl && titleEl.textContent || '').trim(),
+                            cover_url: (coverEl && coverEl.src) || '',
+                            like_count: (likeEl && likeEl.textContent || '').trim(),
+                            type: ''
+                        });
+                    }
+                    return JSON.stringify(results);
+                })();
+            """)
+            if more_json:
+                try:
+                    more_notes = json.loads(more_json)
+                    for n in more_notes:
+                        nid = n.get("note_id")
+                        if nid and nid not in all_note_ids:
+                            all_note_ids.add(nid)
+                            notes.append(n)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if scroll_result.get("at_bottom"):
+                break
+
+        notes = notes[:max_notes]
+
+        screenshot_path = None
+        if take_screenshot:
+            # Scroll back to top for profile screenshot
+            self._evaluate("window.scrollTo({top: 0, behavior: 'smooth'});")
+            self._sleep(0.5, minimum_seconds=0.3)
+            ss = self.capture_screenshot()
+            screenshot_path = ss.get("path")
+
+        print(f"[cdp_publish] User profile: {user_info.get('nickname', '?')}, {len(notes)} notes.")
+        return {
+            "user_id": user_id,
+            "url": url,
+            "user_info": user_info,
+            "notes_count": len(notes),
+            "notes": notes,
+            "screenshot_path": screenshot_path,
+        }
+
+    def read_note_detail(
+        self,
+        feed_id: str,
+        xsec_token: str,
+        take_screenshot: bool = False,
+    ) -> dict[str, Any]:
+        """Read a note's full content, images, and comments in a clean structure.
+
+        Args:
+            feed_id: Note/feed ID.
+            xsec_token: Security token.
+            take_screenshot: Capture screenshot.
+
+        Returns:
+            {"feed_id": "...", "title": "...", "content": "...", "author": {...},
+             "images": [...], "video_url": ..., "stats": {...},
+             "publish_time": "...", "tags": [...], "comments": [...],
+             "screenshot_path": ...}
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        # Use existing get_feed_detail for raw data
+        raw_detail = self.get_feed_detail(feed_id=feed_id, xsec_token=xsec_token)
+
+        # Post-process into clean structure
+        note = raw_detail if isinstance(raw_detail, dict) else {}
+        note_data = note.get("note", note)
+
+        # Extract basic info
+        title = note_data.get("title", "")
+        desc = note_data.get("desc", "")
+
+        # Author
+        user_data = note_data.get("user", {})
+        author = {
+            "nickname": user_data.get("nickName", user_data.get("nickname", "")),
+            "user_id": user_data.get("userId", user_data.get("user_id", "")),
+            "avatar": user_data.get("avatar", ""),
+        }
+
+        # Images
+        image_list = note_data.get("imageList", note_data.get("image_list", []))
+        images = []
+        for img in (image_list or []):
+            url_val = ""
+            if isinstance(img, dict):
+                url_val = (
+                    img.get("urlDefault")
+                    or img.get("url_default")
+                    or img.get("url")
+                    or img.get("urlPre")
+                    or ""
+                )
+                if not url_val:
+                    info_list = img.get("infoList", img.get("info_list", []))
+                    if info_list and isinstance(info_list, list):
+                        url_val = info_list[-1].get("url", "")
+            elif isinstance(img, str):
+                url_val = img
+            if url_val:
+                images.append(url_val)
+
+        # Video
+        video_data = note_data.get("video", {})
+        video_url = None
+        if video_data and isinstance(video_data, dict):
+            media = video_data.get("media", {})
+            stream = media.get("stream", {}) if isinstance(media, dict) else {}
+            # Try h264 first
+            h264 = stream.get("h264", [])
+            if h264 and isinstance(h264, list) and len(h264) > 0:
+                video_url = h264[0].get("masterUrl", h264[0].get("backup_urls", [""])[0] if h264[0].get("backup_urls") else "")
+            if not video_url:
+                h265 = stream.get("h265", [])
+                if h265 and isinstance(h265, list) and len(h265) > 0:
+                    video_url = h265[0].get("masterUrl", "")
+
+        # Stats
+        interact = note_data.get("interactInfo", note_data.get("interact_info", {}))
+        stats = {}
+        if interact and isinstance(interact, dict):
+            stats = {
+                "likes": interact.get("likedCount", interact.get("liked_count", 0)),
+                "collects": interact.get("collectedCount", interact.get("collected_count", 0)),
+                "comments": interact.get("commentCount", interact.get("comment_count", 0)),
+                "shares": interact.get("shareCount", interact.get("share_count", 0)),
+            }
+
+        # Time
+        publish_time = _format_post_time(note_data.get("time"))
+
+        # Tags
+        tag_list = note_data.get("tagList", note_data.get("tag_list", []))
+        tags = []
+        for tag in (tag_list or []):
+            if isinstance(tag, dict):
+                tags.append(tag.get("name", ""))
+            elif isinstance(tag, str):
+                tags.append(tag)
+
+        # Comments
+        raw_comments = note_data.get("comments", [])
+        comments = []
+        for c in (raw_comments or []):
+            if not isinstance(c, dict):
+                continue
+            c_user = c.get("userInfo", c.get("user_info", {}))
+            comments.append({
+                "author": c_user.get("nickname", c_user.get("nickName", "")) if isinstance(c_user, dict) else "",
+                "content": c.get("content", ""),
+                "like_count": c.get("likeCount", c.get("like_count", 0)),
+                "time": _format_post_time(c.get("createTime", c.get("create_time"))),
+            })
+
+        screenshot_path = None
+        if take_screenshot:
+            ss = self.capture_screenshot()
+            screenshot_path = ss.get("path")
+
+        return {
+            "feed_id": feed_id,
+            "title": title,
+            "content": desc,
+            "author": author,
+            "images": images,
+            "video_url": video_url,
+            "stats": stats,
+            "publish_time": publish_time,
+            "tags": tags,
+            "comments": comments,
+            "screenshot_path": screenshot_path,
+        }
+
+    # ------------------------------------------------------------------
+    # Interaction: like, collect, follow
+    # ------------------------------------------------------------------
+
+    def like_note(self, feed_id: str, xsec_token: str) -> dict[str, Any]:
+        """Like a note via CDP mouse click.
+
+        Args:
+            feed_id: Note/feed ID.
+            xsec_token: Security token.
+
+        Returns:
+            {"feed_id": "...", "success": True, "action": "liked"|"already_liked"}
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        print(f"[cdp_publish] Navigating to note for like: {feed_id}")
+        self._navigate(detail_url)
+        self._sleep(PAGE_LOAD_WAIT, minimum_seconds=1.5)
+
+        self._check_feed_page_accessible()
+
+        # Find like button rect and state
+        btn_info = self._evaluate("""
+            (function() {
+                var selectors = [
+                    '.engage-bar .like-wrapper',
+                    '.engage-bar [class*="like"]',
+                    '.note-detail .like-wrapper',
+                    '[class*="interact"] [class*="like"]',
+                    '.like-wrapper',
+                    '[class*="like"][class*="container"]',
+                ];
+                for (var s = 0; s < selectors.length; s++) {
+                    var els = document.querySelectorAll(selectors[s]);
+                    for (var i = 0; i < els.length; i++) {
+                        var el = els[i];
+                        if (!(el instanceof HTMLElement) || el.offsetParent === null) continue;
+                        var r = el.getBoundingClientRect();
+                        if (r.width < 8 || r.height < 8) continue;
+                        var isLiked = el.classList.contains('active') ||
+                                      el.classList.contains('liked') ||
+                                      el.classList.contains('selected') ||
+                                      (el.querySelector && el.querySelector('.active, .liked, [class*="active"]') !== null);
+                        if (!isLiked) {
+                            var style = getComputedStyle(el);
+                            isLiked = style.color === 'rgb(255, 36, 66)' ||
+                                      style.color === 'rgb(255, 72, 72)';
+                        }
+                        return {
+                            x: r.x, y: r.y, width: r.width, height: r.height,
+                            already_liked: isLiked
+                        };
+                    }
+                }
+                return null;
+            })();
+        """)
+
+        if not btn_info:
+            print("[cdp_publish] Could not find like button.")
+            return {"feed_id": feed_id, "success": False, "action": "button_not_found"}
+
+        if btn_info.get("already_liked"):
+            print("[cdp_publish] Note already liked.")
+            return {"feed_id": feed_id, "success": True, "action": "already_liked"}
+
+        # Click via CDP
+        cx = btn_info["x"] + btn_info["width"] / 2
+        cy = btn_info["y"] + btn_info["height"] / 2
+        print(f"[cdp_publish] Clicking like button at ({cx:.0f}, {cy:.0f})...")
+        self._move_mouse(cx, cy)
+        self._sleep(0.2, minimum_seconds=0.1)
+        self._click_mouse(cx, cy)
+        self._sleep(ACTION_INTERVAL, minimum_seconds=0.5)
+
+        print("[cdp_publish] Note liked.")
+        return {"feed_id": feed_id, "success": True, "action": "liked"}
+
+    def collect_note(self, feed_id: str, xsec_token: str) -> dict[str, Any]:
+        """Collect/bookmark a note via CDP mouse click.
+
+        Args:
+            feed_id: Note/feed ID.
+            xsec_token: Security token.
+
+        Returns:
+            {"feed_id": "...", "success": True, "action": "collected"|"already_collected"}
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        print(f"[cdp_publish] Navigating to note for collect: {feed_id}")
+        self._navigate(detail_url)
+        self._sleep(PAGE_LOAD_WAIT, minimum_seconds=1.5)
+
+        self._check_feed_page_accessible()
+
+        btn_info = self._evaluate("""
+            (function() {
+                var selectors = [
+                    '.engage-bar .collect-wrapper',
+                    '.engage-bar [class*="collect"]',
+                    '.note-detail .collect-wrapper',
+                    '[class*="interact"] [class*="collect"]',
+                    '.collect-wrapper',
+                    '[class*="collect"][class*="container"]',
+                    '[class*="star"][class*="container"]',
+                ];
+                for (var s = 0; s < selectors.length; s++) {
+                    var els = document.querySelectorAll(selectors[s]);
+                    for (var i = 0; i < els.length; i++) {
+                        var el = els[i];
+                        if (!(el instanceof HTMLElement) || el.offsetParent === null) continue;
+                        var r = el.getBoundingClientRect();
+                        if (r.width < 8 || r.height < 8) continue;
+                        var isCollected = el.classList.contains('active') ||
+                                          el.classList.contains('collected') ||
+                                          el.classList.contains('selected') ||
+                                          (el.querySelector && el.querySelector('.active, .collected, [class*="active"]') !== null);
+                        if (!isCollected) {
+                            var style = getComputedStyle(el);
+                            isCollected = style.color === 'rgb(255, 214, 0)' ||
+                                          style.color === 'rgb(255, 203, 0)';
+                        }
+                        return {
+                            x: r.x, y: r.y, width: r.width, height: r.height,
+                            already_collected: isCollected
+                        };
+                    }
+                }
+                return null;
+            })();
+        """)
+
+        if not btn_info:
+            print("[cdp_publish] Could not find collect button.")
+            return {"feed_id": feed_id, "success": False, "action": "button_not_found"}
+
+        if btn_info.get("already_collected"):
+            print("[cdp_publish] Note already collected.")
+            return {"feed_id": feed_id, "success": True, "action": "already_collected"}
+
+        cx = btn_info["x"] + btn_info["width"] / 2
+        cy = btn_info["y"] + btn_info["height"] / 2
+        print(f"[cdp_publish] Clicking collect button at ({cx:.0f}, {cy:.0f})...")
+        self._move_mouse(cx, cy)
+        self._sleep(0.2, minimum_seconds=0.1)
+        self._click_mouse(cx, cy)
+        self._sleep(ACTION_INTERVAL, minimum_seconds=0.5)
+
+        print("[cdp_publish] Note collected.")
+        return {"feed_id": feed_id, "success": True, "action": "collected"}
+
+    def follow_user(self, user_id: str) -> dict[str, Any]:
+        """Follow a user via CDP mouse click.
+
+        Args:
+            user_id: Xiaohongshu user ID.
+
+        Returns:
+            {"user_id": "...", "success": True, "action": "followed"|"already_following"}
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        url = XHS_USER_PROFILE_URL_TEMPLATE.format(user_id=user_id.strip())
+        print(f"[cdp_publish] Navigating to user profile for follow: {user_id}")
+        self._navigate(url)
+        self._sleep(PAGE_LOAD_WAIT, minimum_seconds=2.0)
+
+        btn_info = self._evaluate("""
+            (function() {
+                var btns = document.querySelectorAll(
+                    'button, [class*="follow-btn"], [class*="follow-button"], [role="button"]'
+                );
+                for (var i = 0; i < btns.length; i++) {
+                    var el = btns[i];
+                    if (!(el instanceof HTMLElement) || el.offsetParent === null) continue;
+                    var text = (el.textContent || '').replace(/\\s+/g, '').trim();
+                    var r = el.getBoundingClientRect();
+                    if (r.width < 20 || r.height < 15) continue;
+                    var isFollowing = ['已关注', '互相关注', 'Following', 'Mutual'].some(function(k) {
+                        return text.indexOf(k) >= 0;
+                    });
+                    var isFollowBtn = ['关注', 'Follow'].some(function(k) {
+                        return text.indexOf(k) >= 0;
+                    }) && !isFollowing;
+                    if (isFollowBtn || isFollowing) {
+                        return {
+                            x: r.x, y: r.y, width: r.width, height: r.height,
+                            currently_following: isFollowing,
+                            button_text: text
+                        };
+                    }
+                }
+                return null;
+            })();
+        """)
+
+        if not btn_info:
+            print("[cdp_publish] Could not find follow button.")
+            return {"user_id": user_id, "success": False, "action": "button_not_found"}
+
+        if btn_info.get("currently_following"):
+            print(f"[cdp_publish] Already following (button: {btn_info.get('button_text', '')}).")
+            return {"user_id": user_id, "success": True, "action": "already_following"}
+
+        cx = btn_info["x"] + btn_info["width"] / 2
+        cy = btn_info["y"] + btn_info["height"] / 2
+        print(f"[cdp_publish] Clicking follow button at ({cx:.0f}, {cy:.0f})...")
+        self._move_mouse(cx, cy)
+        self._sleep(0.2, minimum_seconds=0.1)
+        self._click_mouse(cx, cy)
+        self._sleep(ACTION_INTERVAL, minimum_seconds=0.5)
+
+        print("[cdp_publish] User followed.")
+        return {"user_id": user_id, "success": True, "action": "followed"}
+
+    def unfollow_user(self, user_id: str) -> dict[str, Any]:
+        """Unfollow a user via CDP mouse click.
+
+        Args:
+            user_id: Xiaohongshu user ID.
+
+        Returns:
+            {"user_id": "...", "success": True, "action": "unfollowed"|"not_following"}
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        url = XHS_USER_PROFILE_URL_TEMPLATE.format(user_id=user_id.strip())
+        print(f"[cdp_publish] Navigating to user profile for unfollow: {user_id}")
+        self._navigate(url)
+        self._sleep(PAGE_LOAD_WAIT, minimum_seconds=2.0)
+
+        btn_info = self._evaluate("""
+            (function() {
+                var btns = document.querySelectorAll(
+                    'button, [class*="follow-btn"], [class*="follow-button"], [role="button"]'
+                );
+                for (var i = 0; i < btns.length; i++) {
+                    var el = btns[i];
+                    if (!(el instanceof HTMLElement) || el.offsetParent === null) continue;
+                    var text = (el.textContent || '').replace(/\\s+/g, '').trim();
+                    var r = el.getBoundingClientRect();
+                    if (r.width < 20 || r.height < 15) continue;
+                    var isFollowing = ['已关注', '互相关注', 'Following', 'Mutual'].some(function(k) {
+                        return text.indexOf(k) >= 0;
+                    });
+                    if (isFollowing) {
+                        return {
+                            x: r.x, y: r.y, width: r.width, height: r.height,
+                            currently_following: true,
+                            button_text: text
+                        };
+                    }
+                }
+                return null;
+            })();
+        """)
+
+        if not btn_info:
+            print("[cdp_publish] Not following this user (no following button found).")
+            return {"user_id": user_id, "success": True, "action": "not_following"}
+
+        cx = btn_info["x"] + btn_info["width"] / 2
+        cy = btn_info["y"] + btn_info["height"] / 2
+        print(f"[cdp_publish] Clicking unfollow button at ({cx:.0f}, {cy:.0f})...")
+        self._move_mouse(cx, cy)
+        self._sleep(0.2, minimum_seconds=0.1)
+        self._click_mouse(cx, cy)
+        self._sleep(0.5, minimum_seconds=0.3)
+
+        # Handle confirmation dialog if it appears
+        self._evaluate("""
+            (function() {
+                var confirmBtns = document.querySelectorAll(
+                    'button, [role="button"], [class*="confirm"], [class*="sure"]'
+                );
+                for (var i = 0; i < confirmBtns.length; i++) {
+                    var text = (confirmBtns[i].textContent || '').trim();
+                    if (text === '确认' || text === '确定' || text === '取消关注') {
+                        confirmBtns[i].click();
+                        return true;
+                    }
+                }
+                return false;
+            })();
+        """)
+        self._sleep(ACTION_INTERVAL, minimum_seconds=0.5)
+
+        print("[cdp_publish] User unfollowed.")
+        return {"user_id": user_id, "success": True, "action": "unfollowed"}
+
+    # ------------------------------------------------------------------
+    # Autonomous browsing (AI agent mode)
+    # ------------------------------------------------------------------
+
+    def autonomous_browse(
+        self,
+        duration_minutes: int = 10,
+        max_detail_reads: int = 8,
+        like_interesting: bool = True,
+        collect_interesting: bool = True,
+    ) -> dict[str, Any]:
+        """Autonomously browse Xiaohongshu for a given duration.
+
+        Browses the home feed, reads interesting notes in detail,
+        optionally likes/collects them, and returns a structured report.
+
+        Note: The "interesting" judgment is NOT done here — this method
+        reads notes and returns all data. Claude (via SKILL.md) decides
+        which notes are interesting based on the persona's interests.
+
+        Args:
+            duration_minutes: How long to browse (approximate).
+            max_detail_reads: Max notes to read in detail.
+            like_interesting: Whether likes are enabled.
+            collect_interesting: Whether collects are enabled.
+
+        Returns:
+            {"duration_minutes": N, "home_feeds": [...], "following_feeds": [...],
+             "detail_reads": [...], "actions_taken": [...]}
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        import time as _time
+        start = _time.time()
+        budget = duration_minutes * 60
+        actions_taken = []
+        detail_reads = []
+
+        def time_left():
+            return budget - (_time.time() - start)
+
+        # Phase 1: Browse home feed (use ~40% of time)
+        print(f"[cdp_publish] Autonomous browse: starting ({duration_minutes} min)...")
+        home_result = self.browse_home_feed(
+            max_items=30,
+            scroll_count=min(5, max(2, duration_minutes // 2)),
+        )
+        home_feeds = home_result.get("feeds", [])
+
+        # Phase 2: Read interesting notes in detail (use ~40% of time)
+        reads_done = 0
+        for feed in home_feeds:
+            if reads_done >= max_detail_reads or time_left() < 30:
+                break
+            note_id = feed.get("note_id", "")
+            xsec_token = feed.get("xsec_token", "")
+            if not note_id or not xsec_token:
+                continue
+
+            try:
+                detail = self.read_note_detail(
+                    feed_id=note_id, xsec_token=xsec_token
+                )
+                detail_reads.append(detail)
+                reads_done += 1
+
+                # Brief pause between reads
+                self._sleep(1.5, minimum_seconds=0.8)
+            except Exception as e:
+                print(f"[cdp_publish] Skipping note {note_id}: {e}")
+                continue
+
+        # Phase 3: Browse following feed (use ~20% of time)
+        following_feeds = []
+        if time_left() > 20:
+            follow_result = self.browse_following_feed(
+                max_items=20,
+                scroll_count=min(3, max(1, duration_minutes // 4)),
+            )
+            following_feeds = follow_result.get("feeds", [])
+
+        elapsed = (_time.time() - start) / 60
+        print(
+            f"[cdp_publish] Autonomous browse complete: "
+            f"{elapsed:.1f} min, {len(home_feeds)} home feeds, "
+            f"{reads_done} detail reads, {len(following_feeds)} following feeds."
+        )
+
+        return {
+            "duration_minutes": round(elapsed, 1),
+            "home_feed_count": len(home_feeds),
+            "home_feeds": home_feeds,
+            "following_feed_count": len(following_feeds),
+            "following_feeds": following_feeds,
+            "detail_reads_count": len(detail_reads),
+            "detail_reads": detail_reads,
+            "actions_taken": actions_taken,
+            "like_enabled": like_interesting,
+            "collect_enabled": collect_interesting,
+        }
+
+    def _select_collection_folder(self, folder_name: str) -> bool:
+        """Try to select a specific collection folder after clicking collect.
+
+        When XHS web shows a folder selection popup after collecting a note,
+        try to find and click the target folder. If the popup doesn't appear
+        or the folder isn't found, returns False (note is still collected
+        to default folder).
+
+        Args:
+            folder_name: Name of the collection folder to select.
+
+        Returns:
+            True if folder was selected, False if not available.
+        """
+        self._sleep(0.8, minimum_seconds=0.4)
+
+        safe_name = folder_name.replace("'", "\\'")
+        result = self._evaluate(f"""
+            (function() {{
+                // Look for collection folder popup/dialog
+                var popups = document.querySelectorAll(
+                    '[class*="collect-popup"], [class*="folder"], [class*="board"],
+                     [class*="collection-list"], [class*="save-to"]'
+                );
+                if (popups.length === 0) return {{ found: false, reason: 'no_popup' }};
+
+                // Try to find the target folder
+                var folderName = '{safe_name}';
+                var allItems = document.querySelectorAll(
+                    '[class*="folder-item"], [class*="board-item"],
+                     [class*="collection-item"], li, [role="option"]'
+                );
+                for (var i = 0; i < allItems.length; i++) {{
+                    var text = (allItems[i].textContent || '').trim();
+                    if (text.indexOf(folderName) >= 0) {{
+                        allItems[i].click();
+                        return {{ found: true, selected: text }};
+                    }}
+                }}
+
+                // Folder not found — try "新建收藏夹" / "Create" button
+                var createBtns = document.querySelectorAll(
+                    '[class*="create"], [class*="new-folder"], [class*="add-board"]'
+                );
+                for (var i = 0; i < createBtns.length; i++) {{
+                    var text = (createBtns[i].textContent || '').trim();
+                    if (text.indexOf('新建') >= 0 || text.indexOf('创建') >= 0) {{
+                        return {{ found: false, reason: 'needs_create', create_button_text: text }};
+                    }}
+                }}
+
+                return {{ found: false, reason: 'folder_not_found' }};
+            }})();
+        """)
+
+        if result and result.get("found"):
+            print(f"[cdp_publish] Selected folder: {result.get('selected')}")
+            return True
+        else:
+            reason = result.get("reason", "unknown") if result else "no_popup"
+            print(f"[cdp_publish] Could not select folder: {reason}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Reply to comments (nested/threaded replies)
+    # ------------------------------------------------------------------
+
+    def reply_to_comment(
+        self,
+        feed_id: str,
+        xsec_token: str,
+        comment_id: str,
+        content: str,
+    ) -> dict[str, Any]:
+        """Reply to a specific comment on a note (二级评论).
+
+        Args:
+            feed_id: Note/feed ID.
+            xsec_token: Security token.
+            comment_id: ID of the comment to reply to.
+            content: Reply text.
+
+        Returns:
+            {"feed_id": "...", "comment_id": "...", "success": True/False,
+             "action": "replied"/"failed"}
+        """
+        if not self.ws:
+            raise CDPError("Not connected. Call connect() first.")
+
+        detail_url = make_feed_detail_url(feed_id, xsec_token)
+        print(f"[cdp_publish] Navigating to note for comment reply: {feed_id}")
+        self._navigate(detail_url)
+        self._sleep(PAGE_LOAD_WAIT, minimum_seconds=2.0)
+
+        self._check_feed_page_accessible()
+
+        # Find the target comment and its reply button
+        found = self._evaluate(f"""
+            (function() {{
+                // Try to find comment by ID attribute or data attribute
+                var commentId = '{comment_id}';
+                var commentEls = document.querySelectorAll(
+                    '[class*="comment-item"], [class*="comment-inner"], [class*="note-comment"]'
+                );
+                for (var i = 0; i < commentEls.length; i++) {{
+                    var el = commentEls[i];
+                    // Check data attributes for comment ID
+                    var dataId = el.getAttribute('data-id') ||
+                                 el.getAttribute('data-comment-id') || '';
+                    // Also check if inner content contains partial ID match
+                    var idMatch = dataId === commentId;
+
+                    if (!idMatch) {{
+                        // Try matching by index if commentId looks like a number
+                        var idx = parseInt(commentId, 10);
+                        if (!isNaN(idx) && i === idx) idMatch = true;
+                    }}
+
+                    if (idMatch) {{
+                        // Find reply button within or near this comment
+                        var replyBtn = el.querySelector(
+                            '[class*="reply"], [class*="回复"], button'
+                        );
+                        if (!replyBtn) {{
+                            // Look for text-based reply links
+                            var links = el.querySelectorAll('span, a, div');
+                            for (var j = 0; j < links.length; j++) {{
+                                var t = (links[j].textContent || '').trim();
+                                if (t === '回复' || t === 'Reply') {{
+                                    replyBtn = links[j];
+                                    break;
+                                }}
+                            }}
+                        }}
+                        if (replyBtn) {{
+                            var r = replyBtn.getBoundingClientRect();
+                            return {{
+                                found: true,
+                                x: r.x, y: r.y,
+                                width: r.width, height: r.height
+                            }};
+                        }}
+                        return {{ found: false, reason: 'no_reply_button' }};
+                    }}
+                }}
+                return {{ found: false, reason: 'comment_not_found' }};
+            }})();
+        """)
+
+        if not found or not found.get("found"):
+            reason = found.get("reason", "unknown") if found else "unknown"
+            print(f"[cdp_publish] Could not find comment to reply: {reason}")
+            return {
+                "feed_id": feed_id,
+                "comment_id": comment_id,
+                "success": False,
+                "action": "failed",
+                "reason": reason,
+            }
+
+        # Click the reply button
+        cx = found["x"] + found["width"] / 2
+        cy = found["y"] + found["height"] / 2
+        print(f"[cdp_publish] Clicking reply button at ({cx:.0f}, {cy:.0f})...")
+        self._move_mouse(cx, cy)
+        self._sleep(0.2, minimum_seconds=0.1)
+        self._click_mouse(cx, cy)
+        self._sleep(1.0, minimum_seconds=0.5)
+
+        # Fill in the reply content using existing comment fill logic
+        self._fill_comment_content(content)
+        self._sleep(ACTION_INTERVAL, minimum_seconds=0.5)
+
+        print("[cdp_publish] Comment reply submitted.")
+        return {
+            "feed_id": feed_id,
+            "comment_id": comment_id,
+            "success": True,
+            "action": "replied",
+            "content": content,
+        }
+
     def _click_publish(self):
         """Click the publish button using CDP mouse events."""
         print("[cdp_publish] Clicking publish button...")
@@ -2431,6 +3685,136 @@ def main():
     p_def = sub.add_parser("set-default-account", help="Set the default account")
     p_def.add_argument("name", help="Account name to set as default")
 
+    # ---- Browsing & interaction commands ----
+
+    # browse-home-feed
+    p_home = sub.add_parser(
+        "browse-home-feed",
+        aliases=["browse_home_feed"],
+        help="Browse Xiaohongshu explore/home feed",
+    )
+    p_home.add_argument("--max-items", type=int, default=20, help="Max items (default: 20)")
+    p_home.add_argument("--scroll-count", type=int, default=3, help="Scroll iterations (default: 3)")
+    p_home.add_argument("--screenshot", action="store_true", help="Take screenshot after loading")
+
+    # browse-following-feed
+    p_follow_feed = sub.add_parser(
+        "browse-following-feed",
+        aliases=["browse_following_feed"],
+        help="Browse content from followed users",
+    )
+    p_follow_feed.add_argument("--max-items", type=int, default=20, help="Max items (default: 20)")
+    p_follow_feed.add_argument("--scroll-count", type=int, default=3, help="Scroll iterations (default: 3)")
+    p_follow_feed.add_argument("--screenshot", action="store_true", help="Take screenshot")
+
+    # read-note-detail
+    p_read = sub.add_parser(
+        "read-note-detail",
+        aliases=["read_note_detail"],
+        help="Read full note content, images, and comments",
+    )
+    p_read.add_argument("--feed-id", required=True, help="Feed id")
+    p_read.add_argument("--xsec-token", required=True, help="xsec token")
+    p_read.add_argument("--screenshot", action="store_true", help="Take screenshot")
+
+    # like-note
+    p_like = sub.add_parser(
+        "like-note",
+        aliases=["like_note"],
+        help="Like a note",
+    )
+    p_like.add_argument("--feed-id", required=True, help="Feed id")
+    p_like.add_argument("--xsec-token", required=True, help="xsec token")
+
+    # collect-note
+    p_collect = sub.add_parser(
+        "collect-note",
+        aliases=["collect_note", "bookmark-note", "bookmark_note"],
+        help="Collect/bookmark a note",
+    )
+    p_collect.add_argument("--feed-id", required=True, help="Feed id")
+    p_collect.add_argument("--xsec-token", required=True, help="xsec token")
+
+    # view-user-profile
+    p_profile = sub.add_parser(
+        "view-user-profile",
+        aliases=["view_user_profile"],
+        help="View a user's profile and notes list",
+    )
+    p_profile.add_argument("--user-id", required=True, help="User ID")
+    p_profile.add_argument("--max-notes", type=int, default=20, help="Max notes (default: 20)")
+    p_profile.add_argument("--scroll-count", type=int, default=2, help="Scroll iterations (default: 2)")
+    p_profile.add_argument("--screenshot", action="store_true", help="Take screenshot")
+
+    # follow-user
+    p_fu = sub.add_parser(
+        "follow-user",
+        aliases=["follow_user"],
+        help="Follow a user",
+    )
+    p_fu.add_argument("--user-id", required=True, help="User ID")
+
+    # unfollow-user
+    p_ufu = sub.add_parser(
+        "unfollow-user",
+        aliases=["unfollow_user"],
+        help="Unfollow a user",
+    )
+    p_ufu.add_argument("--user-id", required=True, help="User ID")
+
+    # capture-screenshot
+    p_ss = sub.add_parser(
+        "capture-screenshot",
+        aliases=["capture_screenshot", "screenshot"],
+        help="Capture a screenshot of the current page",
+    )
+    p_ss.add_argument("--output", help="Output file path")
+    p_ss.add_argument("--quality", type=int, default=80, help="JPEG quality (default: 80)")
+
+    # scroll-page
+    p_scroll = sub.add_parser(
+        "scroll-page",
+        aliases=["scroll_page"],
+        help="Scroll the current page",
+    )
+    p_scroll.add_argument("--direction", choices=["up", "down"], default="down", help="Direction")
+    p_scroll.add_argument("--distance", type=int, default=600, help="Pixels (default: 600)")
+
+    # autonomous-browse
+    p_auto = sub.add_parser(
+        "autonomous-browse",
+        aliases=["autonomous_browse"],
+        help="Autonomously browse XHS and return a report",
+    )
+    p_auto.add_argument(
+        "--duration", type=int, default=10,
+        help="Browse duration in minutes (default: 10)"
+    )
+    p_auto.add_argument(
+        "--max-detail-reads", type=int, default=8,
+        help="Max notes to read in detail (default: 8)"
+    )
+
+    # reply-to-comment
+    p_reply = sub.add_parser(
+        "reply-to-comment",
+        aliases=["reply_to_comment"],
+        help="Reply to a specific comment on a note",
+    )
+    p_reply.add_argument("--feed-id", required=True, help="Feed id")
+    p_reply.add_argument("--xsec-token", required=True, help="xsec token")
+    p_reply.add_argument("--comment-id", required=True, help="Comment ID or index")
+    p_reply_content = p_reply.add_mutually_exclusive_group(required=True)
+    p_reply_content.add_argument("--content", help="Reply content")
+    p_reply_content.add_argument("--content-file", help="Read reply content from file")
+
+    # get-persona
+    p_persona = sub.add_parser(
+        "get-persona",
+        aliases=["get_persona"],
+        help="Show current persona configuration",
+    )
+
     args = parser.parse_args()
     host = args.host
     port = args.port
@@ -2676,6 +4060,165 @@ def main():
             publisher._sleep(1, minimum_seconds=0.5)
             publisher.open_login_page()
             print("SWITCH_ACCOUNT_READY")
+
+        # ---- Browsing & interaction command handlers ----
+
+        elif args.command in ("browse-home-feed", "browse_home_feed"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+            payload = publisher.browse_home_feed(
+                max_items=args.max_items,
+                scroll_count=args.scroll_count,
+                take_screenshot=args.screenshot,
+            )
+            print("BROWSE_HOME_FEED_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("browse-following-feed", "browse_following_feed"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+            payload = publisher.browse_following_feed(
+                max_items=args.max_items,
+                scroll_count=args.scroll_count,
+                take_screenshot=args.screenshot,
+            )
+            print("BROWSE_FOLLOWING_FEED_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("read-note-detail", "read_note_detail"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+            payload = publisher.read_note_detail(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+                take_screenshot=args.screenshot,
+            )
+            print("READ_NOTE_DETAIL_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("like-note", "like_note"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+            payload = publisher.like_note(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+            )
+            print("LIKE_NOTE_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("collect-note", "collect_note", "bookmark-note", "bookmark_note"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+            payload = publisher.collect_note(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+            )
+            print("COLLECT_NOTE_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("view-user-profile", "view_user_profile"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+            payload = publisher.view_user_profile(
+                user_id=args.user_id,
+                max_notes=args.max_notes,
+                scroll_count=args.scroll_count,
+                take_screenshot=args.screenshot,
+            )
+            print("VIEW_USER_PROFILE_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("follow-user", "follow_user"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+            payload = publisher.follow_user(user_id=args.user_id)
+            print("FOLLOW_USER_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("unfollow-user", "unfollow_user"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+            payload = publisher.unfollow_user(user_id=args.user_id)
+            print("UNFOLLOW_USER_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("capture-screenshot", "capture_screenshot", "screenshot"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            payload = publisher.capture_screenshot(
+                output_path=args.output,
+                quality=args.quality,
+            )
+            print("CAPTURE_SCREENSHOT_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("scroll-page", "scroll_page"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            payload = publisher._scroll_page(
+                direction=args.direction,
+                distance=args.distance,
+            )
+            print("SCROLL_PAGE_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("autonomous-browse", "autonomous_browse"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+            payload = publisher.autonomous_browse(
+                duration_minutes=args.duration,
+                max_detail_reads=args.max_detail_reads,
+            )
+            print("AUTONOMOUS_BROWSE_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("reply-to-comment", "reply_to_comment"):
+            publisher.connect(reuse_existing_tab=reuse_existing_tab)
+            if not publisher.check_home_login():
+                print("NOT_LOGGED_IN")
+                sys.exit(1)
+            reply_content = args.content
+            if args.content_file:
+                with open(args.content_file, encoding="utf-8") as f:
+                    reply_content = f.read().strip()
+            if not reply_content:
+                print("Error: --content or --content-file required.", file=sys.stderr)
+                sys.exit(1)
+            payload = publisher.reply_to_comment(
+                feed_id=args.feed_id,
+                xsec_token=args.xsec_token,
+                comment_id=args.comment_id,
+                content=reply_content,
+            )
+            print("REPLY_TO_COMMENT_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        elif args.command in ("get-persona", "get_persona"):
+            from persona_manager import load_persona, get_prompt_prefix, is_initialized
+            persona = load_persona()
+            payload = {
+                "initialized": is_initialized(),
+                "persona": persona,
+                "prompt_prefix": get_prompt_prefix(),
+            }
+            print("GET_PERSONA_RESULT:")
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
 
     finally:
         publisher.disconnect()

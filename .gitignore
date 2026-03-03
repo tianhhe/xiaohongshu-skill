@@ -43,6 +43,10 @@ content.txt
 
 # Config with sensitive data
 config/accounts.json
+config/persona.json
+
+# Browser data (contains login cookies!)
+playwright_data/
 
 # Images
 images/publish_temp/*

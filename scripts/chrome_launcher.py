@@ -10,6 +10,8 @@ Manages a dedicated Chrome instance for Xiaohongshu publishing:
 - Supports multiple accounts with separate profile directories
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import time
@@ -42,6 +44,7 @@ def get_chrome_path() -> str:
         candidates.extend(
             [
                 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Google Chrome 2.app/Contents/MacOS/Google Chrome",
                 os.path.expanduser("~/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
             ]
         )
@@ -140,6 +143,7 @@ def launch_chrome(
         f"--user-data-dir={user_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
+        "--remote-allow-origins=*",
     ]
 
     if headless:
@@ -189,7 +193,7 @@ def kill_chrome(port: int = CDP_PORT):
     # Strategy 1: CDP Browser.close
     try:
         import requests
-        resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=2)
+        resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=2, proxies={"http": None, "https": None})
         if resp.ok:
             ws_url = resp.json().get("webSocketDebuggerUrl")
             if ws_url:

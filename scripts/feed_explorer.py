@@ -51,7 +51,7 @@ class FeedExplorerError(Exception):
     """Raised when search/detail extraction fails."""
 
 
-@dataclass(slots=True)
+@dataclass
 class SearchFilters:
     """Filter options for Xiaohongshu search page."""
 
