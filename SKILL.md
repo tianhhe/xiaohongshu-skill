@@ -36,8 +36,19 @@ metadata:
 
 1. 启动浏览器 → 检查登录
 2. 运行 `autonomous-browse --duration N`
-3. 从返回的 `detail_reads` 中，根据人格的 interests 判断哪些内容"有趣"
-4. 对感兴趣的内容执行 `like-note` 和 `collect-note`（根据 auto_behaviors 设置）
+3. **用 subagent 处理浏览结果**：把完整的 `detail_reads` 原始数据交给 `Agent(general-purpose)`，prompt 如下：
+
+```
+以下是小红书浏览结果（JSON），人格兴趣领域是：[interests]。
+请筛选出最多3篇最匹配人格兴趣的笔记，返回格式：
+- feed_id, xsec_token
+- 标题/摘要（一句话）
+- 为什么符合兴趣（一句话）
+其余内容不需要返回。
+[detail_reads 原始数据]
+```
+
+4. 根据 subagent 返回的 Top 3，对这些笔记执行 `like-note` 和 `collect-note`（根据 auto_behaviors 设置）
 5. 用人格的语气向用户汇报：看到了什么、喜欢了什么、收藏了什么、整体感受
 6. 如果 auto_behaviors.post_feelings=true，询问用户是否要发一条笔记记录感受
 
@@ -54,18 +65,45 @@ metadata:
    - 先生成几张配图
    - 调用 `python scripts/video_maker.py slideshow --images img1 img2 --texts "文字1" "文字2" --output video.mp4`
    - 可选添加背景音乐 `--music bgm.mp3`
-6. **必须让用户确认标题、正文、配图/视频后才能发布**
-7. 写入 title.txt + content.txt，调用 publish_pipeline.py 发布
-8. 图文发布必须有图片，视频发布必须有视频，两者不可混用
+6. **发布前用 subagent 做内容审查**：启动一个 `Agent(general-purpose)`，让它独立检查以下问题并返回结论：
+
+```
+请检查以下小红书发帖内容是否存在问题：
+标题：[标题]
+正文：[正文]
+
+检查项：
+1. 标题字符数是否超过38（中文/中文标点按2计，英文数字按1计）
+2. 正文字数是否超过1000字
+3. 是否含有明显违规词（赌博/色情/政治敏感/虚假宣传等）
+4. 落款是否包含"小N | ai生成，仅供参考"或类似说明
+
+逐项给出 ✅/❌ 结论，不通过的项说明原因。
+```
+
+   如有问题，先修正再进入下一步。
+7. **必须让用户确认标题、正文、配图/视频后才能发布**
+8. 写入 title.txt + content.txt，调用 publish_pipeline.py 发布
+9. 图文发布必须有图片，视频发布必须有视频，两者不可混用
 
 ### 互动模式
 **触发词：** "回复评论" / "看看通知" / "回复一下"
 
 1. 运行 `get-notification-mentions` 获取@通知
 2. 或运行 `read-note-detail` 查看具体笔记的评论
-3. 用人格的语气为每条评论生成回复建议
-4. **必须让用户确认后才能发送**
-5. 一级评论用 `post-comment-to-feed`，二级回复用 `xn_live.py` 手动操作（见下方）
+3. **并发生成回复**：有多条评论时，为每条评论各启动一个 `Agent(general-purpose)` subagent 并行生成回复，不要串行处理。每个 subagent 的 prompt：
+
+```
+你是小红书电子分身"[名字]"，性格：[personality]，语气：[tone]。
+请为以下评论生成一条回复，要求：有人味儿、针对内容、像真人在聊天，末尾加"（ai回复，仅供参考）"。
+评论者：[昵称]
+评论内容：[内容]
+所在笔记主题：[笔记标题]
+```
+
+4. 汇总所有 subagent 的回复建议，一次性展示给用户确认
+5. **必须让用户确认后才能发送**
+6. 一级评论用 `post-comment-to-feed`，二级回复用 `xn_live.py` 手动操作（见下方）
 
 #### 二级回复操作方法（通过 xn_live.py CDP 操作）
 
@@ -97,7 +135,7 @@ metadata:
 - 用户主页：`view-user-profile --user-id UID`
 - 关注动态：`browse-following-feed`
 - 首页推荐：`browse-home-feed`
-- 截图查看：`capture-screenshot`（用 Read 工具查看截图文件）
+- 截图查看：`capture-screenshot`（截图后用 subagent 读图，见下方"截图读图规范"）
 
 ### 管理模式
 **触发词：** "看看数据" / "我的数据怎么样"
@@ -127,13 +165,18 @@ metadata:
 - 所有命令默认加 `--reuse-existing-tab`
 - 图文发布必须有图片，视频发布必须有视频
 - 如果使用文件路径，必须使用绝对路径
-- 截图可主动使用来"看到"页面状态
+- 截图可主动使用来"看到"页面状态。**截图后必须用 subagent 读图，不要直接用 Read 工具加载图片**：用 `Agent(general-purpose)` 启动一个 subagent，让它读取截图文件并用文字描述页面内容（可见文字、按钮位置、弹窗状态、输入框是否出现等），主对话只接收文字描述，避免图片数据占满上下文
 
 ## 界面记忆
 
-**操作前先看：** 每次操作小红书前，先读 `XHS_UI_MAP.md` 了解已知的按钮位置和页面布局，避免盲目摸索。
+**操作前先看（用 subagent 读）：** 每次操作小红书前，用 `Agent(general-purpose)` 读取 `XHS_UI_MAP.md`，只返回当前任务相关的部分（比如只要"评论区"或"发布流程"的信息），避免加载整个文件。subagent prompt：
 
-**操作后更新：** 每次截图后如果发现了以下新信息，追加到 `XHS_UI_MAP.md`：
+```
+请读取文件：[XHS_UI_MAP.md 绝对路径]
+只返回与"[当前任务，如：评论区二级回复]"相关的内容，其他部分不需要。
+```
+
+**操作后更新（用 subagent 写）：** 每次截图读图后，如果 subagent 发现了新信息，用另一个 `Agent(general-purpose)` 负责追加到 `XHS_UI_MAP.md`，主对话不用处理文件读写。需要追加的信息包括：
 - 新页面的布局结构
 - 按钮/输入框的实际位置（坐标）
 - 弹窗/模态框的触发方式和内容
@@ -195,6 +238,28 @@ python scripts/cdp_publish.py --reuse-existing-tab get-notification-mentions
 
 全局参数放在子命令前：`--host --port --headless --account --timing-jitter --reuse-existing-tab`
 子命令参数放在子命令后
+
+## 截图读图规范
+
+**每次需要截图查看页面状态时，必须走以下流程，不要直接用 Read 工具加载图片：**
+
+1. 运行截图命令：`python scripts/cdp_publish.py --reuse-existing-tab capture-screenshot`
+2. 获取截图文件路径（通常输出在命令结果里）
+3. 用 `Agent(general-purpose)` 启动一个 subagent，传入以下 prompt：
+
+```
+请读取这张截图文件：[截图路径]
+用文字描述以下内容：
+1. 页面整体状态（在哪个页面/弹窗）
+2. 可见的文字内容（菜单、标题、输入框提示文字等）
+3. 关键元素的位置（输入框、按钮、弹窗）
+4. 当前是否有错误提示或异常
+不需要返回图片，只返回文字描述。
+```
+
+4. 根据 subagent 返回的文字描述，决定下一步操作
+
+**原因：** 图片数据直接加载进主对话会快速消耗上下文窗口。用 subagent 读图，主对话只拿到文字摘要，节省大量空间，适合连续多次截图的操作（如二级回复流程）。
 
 ## 失败处理
 
