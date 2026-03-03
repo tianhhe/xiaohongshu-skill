@@ -48,6 +48,15 @@ config/persona.json
 # Browser data (contains login cookies!)
 playwright_data/
 
+# Memory runtime data (user-specific, generated at runtime)
+memory/diary/*
+!memory/diary/.gitkeep
+memory/people/people.json
+memory/posts_log.json
+memory/core_memory.md
+memory/inspirations.md
+memory/weekly_digest.md
+
 # Images
 images/publish_temp/*
 !images/publish_temp/.gitkeep
