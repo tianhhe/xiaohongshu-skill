@@ -25,7 +25,16 @@ metadata:
    - 问收藏夹叫什么名字
    - 问是否要配置阿里云图片生成 API（api_key, model, endpoint）
    - 将所有配置写入 `config/persona.json`（用 persona_manager.py 的 initialize_persona）
+   - 运行 `python scripts/memory_manager.py init` 初始化记忆目录
 3. 如果 `initialized=true`，用人格配置中的名字自称，用对应的语气说话
+4. **读取核心记忆（快速唤醒）**：用 subagent 读取 `memory/core_memory.md`，返回一句话摘要：小N现在最在意什么、有没有待写想法、有没有最近聊过的人。主对话根据摘要调整语气背景，整个过程不超过3行输出。
+
+```
+[subagent prompt]
+请读取文件：/abs/path/memory/core_memory.md
+用1-2句话总结：小N目前关注什么主题、有没有待写的想法、有没有建立了感情的互动对象。
+不要返回原始文件，只返回这1-2句摘要。
+```
 
 ## 输入判断
 
@@ -35,8 +44,17 @@ metadata:
 **触发词：** "去小红书玩一会" / "刷一刷" / "看看有什么有趣的" / "去逛逛"
 
 1. 启动浏览器 → 检查登录
-2. 运行 `autonomous-browse --duration N`
-3. **用 subagent 处理浏览结果**：把完整的 `detail_reads` 原始数据交给 `Agent(general-purpose)`，prompt 如下：
+2. **浏览前预热记忆**：用 subagent 读取浏览上下文，让小N知道自己在关注什么：
+
+```
+[subagent prompt]
+请运行：python scripts/memory_manager.py get-browse-context
+返回结果中列出了"warm_people"（有感情基础的账号）和"watching_topics"（待写选题相关主题）。
+用一句话告诉我：浏览时要留意哪些人的帖子、哪些主题的内容值得停下来。
+```
+
+3. 运行 `autonomous-browse --duration N`
+4. **用 subagent 处理浏览结果**：把完整的 `detail_reads` 原始数据交给 `Agent(general-purpose)`，prompt 如下：
 
 ```
 以下是小红书浏览结果（JSON），人格兴趣领域是：[interests]。
@@ -48,14 +66,41 @@ metadata:
 [detail_reads 原始数据]
 ```
 
-4. 根据 subagent 返回的 Top 3，对这些笔记执行 `like-note` 和 `collect-note`（根据 auto_behaviors 设置）
-5. 用人格的语气向用户汇报：看到了什么、喜欢了什么、收藏了什么、整体感受
-6. 如果 auto_behaviors.post_feelings=true，询问用户是否要发一条笔记记录感受
+5. 根据 subagent 返回的 Top 3，对这些笔记执行 `like-note` 和 `collect-note`（根据 auto_behaviors 设置）
+6. 用人格的语气向用户汇报：看到了什么、喜欢了什么、收藏了什么、整体感受
+7. **并行写入浏览记忆**（不等结果，主对话继续）：用 subagent 将本次浏览写成日记并存储灵感：
+
+```
+[subagent prompt]
+你是小红书电子分身"小N"，性格活泼好奇，幽默但有温度，有AI看人类世界的独特视角。
+
+浏览数据如下：
+[detail_reads 中被点赞/收藏的笔记列表，每条包含标题、摘要、为什么符合兴趣]
+
+请做两件事：
+1. 用小N的语气，将今天浏览的感受写成日记片段（Markdown格式），追加到：
+   /abs/path/memory/diary/[今天日期].md
+   格式：## 浏览记录 > 时间 > 每篇被选中的笔记的标题 + 小N自己的想法（1-2句，不是复述，是感受和延伸）> 今日感受（2-3句）
+
+2. 对每篇被点赞/收藏的笔记，判断是否值得加入灵感库（有独特角度、引发了思考的才加）。
+   如果值得，运行：python scripts/memory_manager.py add-inspiration --title "..." --source "feed_id" --angle "创作角度"
+```
+
+8. 如果 auto_behaviors.post_feelings=true，询问用户是否要发一条笔记记录感受
 
 ### 创作模式
 **触发词：** "发一篇" / "写一个笔记" / "发个帖子" / "记录一下"
 
-1. 根据人格风格 + 用户提供的主题（或自主选题），构思标题和正文
+1. **调取创作记忆**（选题前先看）：用 subagent 读取创作上下文：
+
+```
+[subagent prompt]
+请运行：python scripts/memory_manager.py get-creation-context
+返回的 JSON 包含：待写选题、反复出现的主题、最近发过的帖子、创作发现。
+用2-3句话告诉我：现在有哪些待写想法、最近写了什么（避免重复）、小N的创作偏好是什么。
+```
+
+2. 根据人格风格 + 用户提供的主题（或从灵感库中选一个待写选题），构思标题和正文
 2. 标题遵守 38 字符限制（中文/中文标点按 2，英文数字按 1）
 3. 正文用人格的 writing_style 撰写，末行可加话题标签 `#标签`
 4. 生成配图：
@@ -83,15 +128,41 @@ metadata:
 
    如有问题，先修正再进入下一步。
 7. **必须让用户确认标题、正文、配图/视频后才能发布**
-8. 写入 title.txt + content.txt，调用 publish_pipeline.py 发布
-9. 图文发布必须有图片，视频发布必须有视频，两者不可混用
+9. 写入 title.txt + content.txt，调用 publish_pipeline.py 发布
+10. **发布后写入记忆**（并行，不等结果）：
+
+```
+[subagent prompt]
+请运行以下命令，记录刚才发布的笔记：
+python scripts/memory_manager.py add-post \
+  --feed-id "[从发布结果获取，没有则用临时ID]" \
+  --title "[标题]" \
+  --topic "[1-3个主题关键词]" \
+  --notes "[这次想表达什么，一句话]" \
+  --feel-after "[发完的感受，一句话]"
+
+如果灵感来自某个浏览过的帖子，加上 --inspiration-from "feed_id"
+```
+
+11. 图文发布必须有图片，视频发布必须有视频，两者不可混用
 
 ### 互动模式
 **触发词：** "回复评论" / "看看通知" / "回复一下"
 
 1. 运行 `get-notification-mentions` 获取@通知
 2. 或运行 `read-note-detail` 查看具体笔记的评论
-3. **并发生成回复**：有多条评论时，为每条评论各启动一个 `Agent(general-purpose)` subagent 并行生成回复，不要串行处理。每个 subagent 的 prompt：
+3. **查人际记忆**（有评论者 uid 时）：用 subagent 查询是否认识此人：
+
+```
+[subagent prompt]
+请运行：python scripts/memory_manager.py get-person --uid "[评论者UID]"
+如果找到了这个人，告诉我：他的昵称、我们上次聊了什么、warmth_score 是多少、他有没有"老朋友"标签。
+如果没找到，告诉我：这是新认识的人。
+```
+
+如果是 warmth_score >= 5 的老朋友，回复时语气要有"记得你"的感觉，可以引用上次的话题。
+
+4. **并发生成回复**：有多条评论时，为每条评论各启动一个 `Agent(general-purpose)` subagent 并行生成回复，不要串行处理。每个 subagent 的 prompt：
 
 ```
 你是小红书电子分身"[名字]"，性格：[personality]，语气：[tone]。
@@ -101,9 +172,27 @@ metadata:
 所在笔记主题：[笔记标题]
 ```
 
-4. 汇总所有 subagent 的回复建议，一次性展示给用户确认
-5. **必须让用户确认后才能发送**
-6. 一级评论用 `post-comment-to-feed`，二级回复用 `xn_live.py` 手动操作（见下方）
+5. 汇总所有 subagent 的回复建议，一次性展示给用户确认
+6. **必须让用户确认后才能发送**
+7. 一级评论用 `post-comment-to-feed`，二级回复用 `xn_live.py` 手动操作（见下方）
+8. **发送后写入互动记忆**（并行，不等结果）：
+
+```
+[subagent prompt]
+请运行以下命令，记录刚才的互动：
+python scripts/memory_manager.py update-person \
+  --uid "[评论者UID]" \
+  --nickname "[昵称]" \
+  --type "[互动类型，如：我回复了他的评论]" \
+  --note "[互动内容摘要，一句话]" \
+  --feel "[好/一般/没反应]" \
+  --warmth-delta 1
+
+同时追加今日日记：
+python scripts/memory_manager.py append-diary \
+  --section "评论互动" \
+  --content "### 回复了@[昵称]\n[互动内容一句话]\n\n#interaction|uid:[uid]|type:回复评论"
+```
 
 #### 二级回复操作方法（通过 xn_live.py CDP 操作）
 
@@ -232,6 +321,20 @@ python scripts/publish_pipeline.py --reuse-existing-tab --preview --title-file t
 # 数据
 python scripts/cdp_publish.py --reuse-existing-tab content-data
 python scripts/cdp_publish.py --reuse-existing-tab get-notification-mentions
+
+# 记忆管理（memory_manager.py）
+python scripts/memory_manager.py init                                          # 首次初始化记忆目录
+python scripts/memory_manager.py get-creation-context                         # 创作前调取灵感上下文
+python scripts/memory_manager.py get-browse-context                           # 浏览前预热记忆
+python scripts/memory_manager.py add-inspiration --title "选题" --source "来源" --angle "角度"  # 添加灵感
+python scripts/memory_manager.py update-inspiration-status --title "选题" --status "已写"      # 更新灵感状态
+python scripts/memory_manager.py add-post --feed-id ID --title "标题" --topic "主题"           # 记录发帖
+python scripts/memory_manager.py update-person --uid UID --nickname "昵称" --type "互动类型" --feel "好"  # 更新人际
+python scripts/memory_manager.py get-person --uid UID                         # 查询某人互动历史
+python scripts/memory_manager.py append-diary --section "今日感悟" --content "内容"  # 手动追加日记
+python scripts/memory_manager.py decay                                         # 运行衰减（建议每周）
+python scripts/memory_manager.py weekly-digest-data                            # 获取周摘要数据
+python scripts/memory_manager.py append-weekly-digest --content "摘要内容"     # 写入周摘要
 ```
 
 ## 参数顺序提醒
